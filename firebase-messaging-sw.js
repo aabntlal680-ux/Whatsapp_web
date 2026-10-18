@@ -23,21 +23,41 @@ const firebaseConfig = {
 firebase.initializeApp(firebaseConfig);
 const messaging = firebase.messaging();
 
+// FCM may retry delivery. Keep a short-lived in-memory id cache so a retry
+// cannot create two system notifications while this worker is alive.
+const recentMessageIds = new Map();
+const MESSAGE_DEDUP_WINDOW_MS = 60_000;
+
+function wasRecentlyHandled(messageId) {
+  if (!messageId) return false;
+  const now = Date.now();
+  for (const [id, timestamp] of recentMessageIds) {
+    if (now - timestamp > MESSAGE_DEDUP_WINDOW_MS) recentMessageIds.delete(id);
+  }
+  if (recentMessageIds.has(messageId)) return true;
+  recentMessageIds.set(messageId, now);
+  return false;
+}
+
 messaging.onBackgroundMessage((payload) => {
   console.log("[firebase-messaging-sw.js] Background message:", payload);
 
-  const notification = payload?.notification || {};
+  // The sender uses data-only FCM messages. The notification fallback is kept
+  // only for older queued messages during rollout.
   const data = payload?.data || {};
-  const conversationId = data.conversationId || data.conversation_id || "";
+  const notification = payload?.notification || {};
+  const messageId = data.messageId || data.message_id || payload?.messageId || "";
+  if (wasRecentlyHandled(messageId)) return;
 
-  const title = notification.title || data.title || "رسالة جديدة";
-  const body = notification.body || data.body || "لديك رسالة جديدة";
+  const conversationId = data.conversationId || data.conversation_id || "";
+  const title = data.title || notification.title || "رسالة جديدة";
+  const body = data.body || notification.body || "لديك رسالة جديدة";
 
   const notificationOptions = {
     body,
     icon: data.icon || "./icons/icon.png",
     badge: data.badge || "./icons/icon.png",
-    tag: conversationId || "whatsapp-message",
+    tag: messageId || conversationId || "whatsapp-message",
     renotify: true,
     requireInteraction: true,
     silent: false,

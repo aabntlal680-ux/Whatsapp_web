@@ -1,5 +1,6 @@
 import { supabase } from "./supabaseClient.js";
 import { isAdminEmail } from "./config.js";
+import { removeFcmToken } from "./push.js";
 
 export async function signUp({ email, password, displayName, phone }) {
   const normalizedEmail = email.trim().toLowerCase();
@@ -58,6 +59,9 @@ export async function signIn({ email, password }) {
 }
 
 export async function signOut(userId) {
+  // تُحذف ملكية الرمز قبل signOut حتى تسمح RLS للمستخدم الحالي بالحذف.
+  await removeFcmToken(userId);
+
   if (userId) {
     try {
       await supabase

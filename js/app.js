@@ -14,7 +14,8 @@ import {
 } from "./db.js";
 import {
   enablePushNotifications,
-  disablePushNotifications,
+  registerFcmToken,
+  removeFcmToken,
   listenForForegroundMessages,
 } from "./push.js";
 
@@ -52,6 +53,9 @@ const state = {
   recording: null,
 
   isOnline: navigator.onLine,
+  // هذا التطبيق نسخة PWA وليست React Native؛ document.visibilityState هو
+  // المكافئ المباشر لـ AppState.active/background في المتصفح.
+  appState: document.visibilityState === "visible" ? "active" : "background",
 
   clickedWelcomeButtons: new Set(),
 
@@ -95,11 +99,24 @@ async function boot() {
     showAuthScreen();
   }
 
-  supabase.auth.onAuthStateChange((event) => {
-    if (event === "SIGNED_OUT") {
-      state.me = null;
-      showAuthScreen();
-    }
+  // دورة FCM مرتبطة بمصدر الحقيقة الوحيد للمصادقة. نستخدم setTimeout حتى
+  // لا ننفذ طلبات Supabase متداخلة داخل قفل onAuthStateChange الداخلي.
+  supabase.auth.onAuthStateChange((event, session) => {
+    setTimeout(async () => {
+      if (
+        (event === "SIGNED_IN" || event === "INITIAL_SESSION") &&
+        session?.user
+      ) {
+        await registerFcmToken(session.user.id);
+        return;
+      }
+
+      if (event === "SIGNED_OUT") {
+        await removeFcmToken();
+        state.me = null;
+        showAuthScreen();
+      }
+    }, 0);
   });
 
   window.addEventListener("beforeunload", () => {
@@ -110,9 +127,11 @@ async function boot() {
   });
 
   document.addEventListener("visibilitychange", async () => {
+    state.appState = document.visibilityState === "visible" ? "active" : "background";
+
     if (!state.me) return;
 
-    if (document.visibilityState === "hidden") {
+    if (state.appState === "background") {
       await touchLastSeen(false);
     } else {
       await touchLastSeen(true);
@@ -200,6 +219,10 @@ function openConversationUIState(conversationId) {
 
 function closeChatView() {
   document.body.classList.remove("viewing-chat");
+  closeMediaViewer();
+  state.activeConversation = null;
+  $("#chat-options-menu")?.classList.add("hidden");
+  $("#chat-options-toggle")?.setAttribute("aria-expanded", "false");
 
   $("#chat-panel")?.classList.remove("mobile-visible");
   $("#sidebar")?.classList.remove("mobile-hidden");
@@ -256,6 +279,13 @@ async function enterApp() {
 
   $("#auth-screen")?.classList.add("hidden");
   $("#app-shell")?.classList.remove("hidden");
+
+  const moderationRoles = await getModerationRoles(state.me.id);
+  state.me.chat_roles = moderationRoles;
+  state.me.can_moderate = Boolean(
+    state.me.is_admin ||
+    moderationRoles.some((role) => ["admin", "moderator"].includes(role))
+  );
 
   $("#my-name").textContent = state.me.display_name;
 
@@ -330,8 +360,43 @@ function extractNotificationMessage(payload) {
   return null;
 }
 
-async function handleForegroundNotification(payload) {
+function showInAppNotification({ title, body, conversationId }) {
+  let banner = $("#in-app-notification");
+  if (!banner) {
+    banner = document.createElement("button");
+    banner.id = "in-app-notification";
+    banner.type = "button";
+    banner.className = "in-app-notification hidden";
+    document.body.appendChild(banner);
+  }
+
+  banner.innerHTML = `
+    <strong>${escapeHtml(title || "رسالة جديدة")}</strong>
+    <span>${escapeHtml(body || "لديك رسالة جديدة")}</span>
+  `;
+  banner.classList.remove("hidden");
+  clearTimeout(banner._hideTimeout);
+  banner._hideTimeout = setTimeout(() => banner.classList.add("hidden"), 6500);
+
+  banner.onclick = async () => {
+    banner.classList.add("hidden");
+    if (conversationId) await openConversationById(conversationId);
+  };
+}
+
+async function handleForegroundNotification(notification) {
+  if (state.appState !== "active") return;
+
+  const payload = notification?.payload || notification;
+  const data = notification?.data || payload?.data || {};
+  const conversationId = data.conversation_id || data.conversationId || payload?.conversation_id || payload?.conversationId;
   const message = extractNotificationMessage(payload);
+
+  showInAppNotification({
+    title: notification?.title || data.title || "رسالة جديدة",
+    body: notification?.body || data.body || message?.content || "لديك رسالة جديدة",
+    conversationId,
+  });
 
   if (message?.conversation_id) {
     await patchContactUIOnNewMessage(message);
@@ -561,6 +626,8 @@ function wireChrome() {
   );
 
   wireChatPanel();
+  wireConversationOptions();
+  wireMediaViewer();
   wireEmojiPicker();
 }
 
@@ -642,6 +709,42 @@ function wireChatPanel() {
     "click",
     cancelRecording
   );
+}
+
+function wireConversationOptions() {
+  $("#chat-options-toggle")?.addEventListener("click", (event) => {
+    event.stopPropagation();
+    const menu = $("#chat-options-menu");
+    if (!menu) return;
+    const willOpen = menu.classList.contains("hidden");
+    updateConversationOptions();
+    menu.classList.toggle("hidden", !willOpen);
+    $("#chat-options-toggle")?.setAttribute("aria-expanded", String(willOpen));
+  });
+
+  $("#chat-remove-member")?.addEventListener("click", async () => {
+    $("#chat-options-menu")?.classList.add("hidden");
+    await removeActiveChatMember();
+  });
+
+  document.addEventListener("click", (event) => {
+    const menu = $("#chat-options-menu");
+    const trigger = $("#chat-options-toggle");
+    if (menu && !menu.contains(event.target) && event.target !== trigger) {
+      menu.classList.add("hidden");
+      trigger?.setAttribute("aria-expanded", "false");
+    }
+  });
+}
+
+function wireMediaViewer() {
+  $("#media-viewer-close")?.addEventListener("click", closeMediaViewer);
+  $("#media-viewer-modal")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) closeMediaViewer();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") closeMediaViewer();
+  });
 }
 
 // ===============================================================
@@ -771,7 +874,7 @@ async function getConversationUnreadCounts(conversationIds) {
 async function loadContactsFromNetwork() {
   resetContactIndex();
 
-  if (!state.me.is_admin) {
+  if (!state.me.can_moderate) {
     const [profilesResult, conversationsResult] = await Promise.all([
       supabase
         .from("profiles")
@@ -865,9 +968,11 @@ async function loadContactsFromNetwork() {
 
   const convs = state.me.is_super_admin
     ? conversationsResult.data
-    : (conversationsResult.data || []).filter(
+    : state.me.is_admin
+    ? (conversationsResult.data || []).filter(
         (conversation) => conversation.admin_id === state.me.id
-      );
+      )
+    : (conversationsResult.data || []);
   const convsError = conversationsResult.error;
 
   if (convsError) {
@@ -886,6 +991,7 @@ async function loadContactsFromNetwork() {
     userContacts.push({
       ...c.user,
       _conversationId: c.id,
+      _adminId: c.admin_id,
       _unread: unreadCounts[c.id] || 0,
       _lastMessage: c.last_message,
       _lastMessageAt: c.last_message_at || null,
@@ -1248,7 +1354,7 @@ async function openConversationById(conversationId) {
     .eq("id", conversationId)
     .maybeSingle();
   if (error || !conversation) return;
-  const otherId = state.me.is_admin
+  const otherId = state.me.can_moderate
     ? conversation.user_id
     : conversation.admin_id;
   const { data: profile } = await supabase.from("profiles").select("*").eq("id", otherId).maybeSingle();
@@ -1258,6 +1364,86 @@ async function openConversationById(conversationId) {
 // ===============================================================
 // CONVERSATION
 // ===============================================================
+
+function isActiveChatModerator() {
+  return ["admin", "moderator"].includes(
+    state.activeConversation?.memberRole
+  );
+}
+
+function getActiveChatTargetId() {
+  const conversation = state.activeConversation;
+  if (!conversation || !state.me?.id) return null;
+  return String(state.me.id) === String(conversation.userId)
+    ? conversation.adminId
+    : conversation.userId;
+}
+
+function updateConversationOptions() {
+  const removeButton = $("#chat-remove-member");
+  if (!removeButton) return;
+
+  const canRemove = Boolean(
+    isActiveChatModerator() &&
+    getActiveChatTargetId() &&
+    String(getActiveChatTargetId()) !== String(state.me?.id)
+  );
+
+  removeButton.classList.toggle("hidden", !canRemove);
+}
+
+async function getModerationRoles(userId) {
+  if (!userId) return [];
+  const { data, error } = await supabase
+    .from("chat_members")
+    .select("role")
+    .eq("user_id", userId)
+    .in("role", ["admin", "moderator"]);
+  if (error) {
+    console.warn("تعذّر قراءة أدوار المستخدم:", error.message);
+    return [];
+  }
+  return [...new Set((data || []).map((item) => item.role))];
+}
+
+async function getChatMemberRole(conversationId, userId) {
+  if (!conversationId || !userId) return null;
+  const { data, error } = await supabase
+    .from("chat_members")
+    .select("role")
+    .eq("conversation_id", conversationId)
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (error) {
+    console.warn("تعذّر قراءة دور عضو المحادثة:", error.message);
+    return null;
+  }
+
+  return data?.role || null;
+}
+
+async function removeActiveChatMember() {
+  const conversation = state.activeConversation;
+  const targetUserId = getActiveChatTargetId();
+
+  if (!conversation?.id || !isActiveChatModerator() || !targetUserId) return;
+  if (!window.confirm("حذف المستخدم من هذه المحادثة؟")) return;
+
+  const { error } = await supabase.rpc("remove_chat_member", {
+    p_conversation_id: conversation.id,
+    p_user_id: targetUserId,
+  });
+
+  if (error) {
+    showAuthError("تعذّر حذف المستخدم من المحادثة: " + error.message);
+    return;
+  }
+
+  closeChatView();
+  await loadContacts();
+  showAuthError("تم حذف المستخدم من المحادثة.");
+}
 
 async function openConversation(otherProfile) {
   if (!otherProfile.id) {
@@ -1279,10 +1465,15 @@ async function openConversation(otherProfile) {
 
     clearReply();
 
-    const userId = state.me.is_admin
+    const isStaffOpeningUserChat = Boolean(
+      state.me.can_moderate && otherProfile._conversationId
+    );
+    const userId = isStaffOpeningUserChat || state.me.is_admin
       ? otherProfile.id
       : state.me.id;
-    const adminId = state.me.is_admin
+    const adminId = isStaffOpeningUserChat
+      ? otherProfile._adminId || state.me.id
+      : state.me.is_admin
       ? state.me.id
       : otherProfile.id;
 
@@ -1329,12 +1520,17 @@ async function openConversation(otherProfile) {
       }
     }
 
+    const memberRole = await getChatMemberRole(conversationId, state.me.id);
+
     state.activeConversation = {
       id: conversationId,
       userId,
       adminId,
       otherProfile,
+      memberRole,
     };
+
+    updateConversationOptions();
 
     openConversationUIState(
       conversationId
@@ -1518,6 +1714,10 @@ function messagePreviewText(m) {
     return "🎤 رسالة صوتية";
   }
 
+  if (m.attachment_type === "video") {
+    return "🎬 فيديو";
+  }
+
   if (m.attachment_type === "file") {
     return "📎 ملف";
   }
@@ -1535,7 +1735,7 @@ function isMessageMine(message) {
 
 function isMessageFromUser(message) {
   if (!message?.sender_id || !state.activeConversation) return false;
-  const ordinaryUserId = state.me?.is_admin
+  const ordinaryUserId = state.me?.can_moderate
     ? state.activeConversation.userId
     : state.me.id;
   return String(message.sender_id) === String(ordinaryUserId);
@@ -1595,18 +1795,35 @@ function buildMessageBubble(m) {
       : "";
 
   let attach = "";
+  let mediaHint = "";
 
   if (m.attachment_url) {
     if (m.attachment_type === "image") {
       attach = `
         <img
-          class="msg-attachment"
+          class="msg-attachment msg-image"
           src="${escapeHtml(m.attachment_url)}"
-          alt=""
+          alt="صورة مرفقة"
           loading="lazy"
           decoding="async"
+          data-media-url="${escapeHtml(m.attachment_url)}"
+          data-media-type="image"
         >
       `;
+      mediaHint = `<div class="media-save-hint">اضغط مطولا لحفظ الصورة</div>`;
+    } else if (m.attachment_type === "video") {
+      attach = `
+        <video
+          class="msg-video"
+          controls
+          playsinline
+          preload="metadata"
+          src="${escapeHtml(m.attachment_url)}"
+          data-media-url="${escapeHtml(m.attachment_url)}"
+          data-media-type="video"
+        ></video>
+      `;
+      mediaHint = `<div class="media-save-hint">اضغط مطولا لحفظ الفيديو</div>`;
     } else if (m.attachment_type === "audio") {
       attach = `
         <audio
@@ -1673,7 +1890,7 @@ function buildMessageBubble(m) {
       : "";
 
   let buttonsHtml = "";
-  const canDeleteMessage = Boolean(state.me?.is_admin && !m._pending);
+  const canDeleteMessage = Boolean(isActiveChatModerator() && !m._pending);
 
   if (
     !mine &&
@@ -1732,6 +1949,7 @@ function buildMessageBubble(m) {
 
       ${quotedHtml}
       ${attach}
+      ${mediaHint}
 
       ${
         m.content
@@ -1796,6 +2014,18 @@ function buildMessageBubble(m) {
     event.stopPropagation();
     await deleteMessage(m);
   });
+
+  const mediaElement = div.querySelector("[data-media-url]");
+  if (mediaElement) {
+    if (mediaElement.dataset.mediaType === "image") {
+      mediaElement.addEventListener("click", () => {
+        openMediaViewer(mediaElement.dataset.mediaUrl, "image");
+      });
+    }
+    wireMediaLongPress(mediaElement, m);
+  }
+
+  wireMessageLongPress(div, canDeleteMessage);
 
   const reactBtn =
     div.querySelector(
@@ -1880,11 +2110,135 @@ function buildMessageBubble(m) {
   return div;
 }
 
+function openMediaViewer(url, type) {
+  const modal = $("#media-viewer-modal");
+  const image = $("#media-viewer-image");
+  const video = $("#media-viewer-video");
+  if (!modal || !url) return;
+
+  image?.classList.toggle("hidden", type !== "image");
+  video?.classList.toggle("hidden", type !== "video");
+
+  if (type === "image" && image) {
+    image.src = url;
+  }
+
+  if (type === "video" && video) {
+    video.src = url;
+    video.currentTime = 0;
+  }
+
+  modal.classList.remove("hidden");
+  document.body.classList.add("media-viewer-open");
+}
+
+function closeMediaViewer() {
+  const modal = $("#media-viewer-modal");
+  const image = $("#media-viewer-image");
+  const video = $("#media-viewer-video");
+  if (!modal) return;
+
+  modal.classList.add("hidden");
+  document.body.classList.remove("media-viewer-open");
+  if (image) image.removeAttribute("src");
+  if (video) {
+    video.pause();
+    video.removeAttribute("src");
+    video.load();
+  }
+}
+
+async function saveMediaAttachment(message) {
+  const url = message?.attachment_url;
+  if (!url) return;
+
+  try {
+    const response = await fetch(url, { mode: "cors" });
+    if (!response.ok) throw new Error("تعذّر تنزيل الميديا");
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = objectUrl;
+    anchor.download = `whatsapp-${message.id || Date.now()}.${message.attachment_type === "video" ? "mp4" : "jpg"}`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    showAuthError("تم حفظ الميديا على جهازك.");
+  } catch (error) {
+    // روابط Storage العامة قد تمنع fetch عبر CORS؛ نترك للمتصفح تنزيل الرابط مباشرة.
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = "";
+    anchor.target = "_blank";
+    anchor.rel = "noopener noreferrer";
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    console.warn("تعذّر تنزيل الميديا مباشرة، تم فتح الرابط:", error);
+  }
+}
+
+function wireMediaLongPress(mediaElement, message) {
+  let timer = null;
+  const start = (event) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return;
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      event.preventDefault();
+      saveMediaAttachment(message);
+      if (navigator.vibrate) navigator.vibrate(15);
+    }, 650);
+  };
+  const cancel = () => clearTimeout(timer);
+
+  mediaElement.addEventListener("pointerdown", start);
+  mediaElement.addEventListener("pointerup", cancel);
+  mediaElement.addEventListener("pointercancel", cancel);
+  mediaElement.addEventListener("pointerleave", cancel);
+  mediaElement.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    saveMediaAttachment(message);
+  });
+}
+
+function wireMessageLongPress(row, canDelete) {
+  if (!canDelete) return;
+  let timer = null;
+  let longPressed = false;
+
+  row.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("button, a, input, audio, video, img")) return;
+    longPressed = false;
+    timer = setTimeout(() => {
+      longPressed = true;
+      row.classList.add("long-pressed");
+      if (navigator.vibrate) navigator.vibrate(15);
+    }, 650);
+  });
+
+  ["pointerup", "pointercancel", "pointerleave"].forEach((name) => {
+    row.addEventListener(name, () => clearTimeout(timer));
+  });
+
+  row.addEventListener("contextmenu", (event) => {
+    event.preventDefault();
+    row.classList.add("long-pressed");
+  });
+}
+
 async function deleteMessage(message) {
-  if (!state.me?.is_admin || !message?.id || message._pending) return;
+  if (!isActiveChatModerator() || !message?.id || message._pending) return;
   if (!window.confirm("هل تريد حذف هذه الرسالة؟")) return;
-  const { error } = await supabase.from("messages").delete().eq("id", message.id);
-  if (error) { showAuthError("تعذّر حذف الرسالة: " + error.message); return; }
+
+  const { error } = await supabase.rpc("delete_message_as_moderator", {
+    p_message_id: message.id,
+  });
+  if (error) {
+    showAuthError("تعذّر حذف الرسالة: " + error.message);
+    return;
+  }
+
   state.messages = state.messages.filter((item) => item.id !== message.id);
   await deleteCachedMessage(message.id);
   delete state.reactions[message.id];
@@ -2148,6 +2502,9 @@ function getSafeFileExtension(
   const mimeMap = {
     "image/jpeg": "jpg",
     "image/jpg": "jpg",
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+    "video/quicktime": "mov",
     "image/png": "png",
     "image/webp": "webp",
     "image/gif": "gif",
@@ -2482,6 +2839,8 @@ async function sendMessage({
         true,
         attachmentType === "image"
           ? "جاري رفع الصورة، يرجى الانتظار..."
+          : attachmentType === "video"
+          ? "جاري رفع الفيديو، يرجى الانتظار..."
           : attachmentType === "audio"
           ? "جاري رفع الرسالة الصوتية، يرجى الانتظار..."
           : "جاري رفع الملف، يرجى الانتظار..."
@@ -2677,6 +3036,11 @@ async function handleAttachmentUpload(e) {
     file.type.startsWith("image/")
   ) {
     type = "image";
+  } else if (
+    file.type &&
+    file.type.startsWith("video/")
+  ) {
+    type = "video";
   } else if (
     file.type &&
     file.type.startsWith("audio/")
@@ -3257,8 +3621,15 @@ function subscribeToConversation(
             `conversation_id=eq.${conversationId}`,
         },
         async (payload) => {
-          const message =
-            payload.new;
+          const message = payload.new;
+          const isIncoming = String(message.sender_id) !== String(state.me.id);
+          const receivedMessage = isIncoming && message.status === "sent"
+            ? { ...message, status: "delivered" }
+            : message;
+
+          if (isIncoming && message.status === "sent") {
+            persistDeliveredStatus(message.id);
+          }
 
           // =======================================================
           // LIVE CHAT APPEND
@@ -3267,19 +3638,17 @@ function subscribeToConversation(
           const exists =
             state.messages.some(
               (m) =>
-                m.id === message.id
+                m.id === receivedMessage.id
             );
 
           if (!exists) {
-            state.messages.push(
-              message
-            );
+            state.messages.push(receivedMessage);
 
             renderMessages();
 
             await cacheMessages(
               conversationId,
-              [message]
+              [receivedMessage]
             );
           }
 
@@ -3296,10 +3665,7 @@ function subscribeToConversation(
             }
           );
 
-          if (
-            message.sender_id !==
-            state.me.id
-          ) {
+          if (isIncoming) {
             playNotificationSound();
 
             // المحادثة مفتوحة، لذلك لا نزيد العداد.
@@ -3430,6 +3796,25 @@ function subscribeToConversation(
       .subscribe((status) => {
         scheduleRealtimeReconnect(status);
       });
+}
+
+// ===============================================================
+// MESSAGE DELIVERY / READ STATUS
+// ===============================================================
+
+async function persistDeliveredStatus(messageId) {
+  if (!state.me || !messageId) return;
+
+  const { error } = await supabase
+    .from("messages")
+    .update({ status: "delivered" })
+    .eq("id", messageId)
+    .neq("sender_id", state.me.id)
+    .eq("status", "sent");
+
+  if (error) {
+    console.warn("persistDeliveredStatus failed:", error.message);
+  }
 }
 
 // ===============================================================
@@ -3845,11 +4230,13 @@ function subscribeGlobalMessageWatch() {
           // ========================================================
 
           if (isActive) {
-            clearUnreadBadge(
-              msg.conversation_id
-            );
-
+            clearUnreadBadge(msg.conversation_id);
+            if (msg.status === "sent") persistDeliveredStatus(msg.id);
             return;
+          }
+
+          if (msg.status === "sent") {
+            persistDeliveredStatus(msg.id);
           }
 
           playNotificationSound();

@@ -60,7 +60,15 @@ serve(async (req) => {
 
     const accessToken = await getAccessToken();
     const endpoint = `https://fcm.googleapis.com/v1/projects/${FIREBASE_PROJECT_ID}/messages:send`;
-    const body = record.content || (record.attachment_type === "image" ? "📷 صورة" : record.attachment_type === "audio" ? "🎤 رسالة صوتية" : "📎 ملف");
+    const body = record.content || (
+      record.attachment_type === "image"
+        ? "📷 صورة"
+        : record.attachment_type === "video"
+        ? "🎬 فيديو"
+        : record.attachment_type === "audio"
+        ? "🎤 رسالة صوتية"
+        : "📎 ملف"
+    );
     const results = await Promise.all(tokens.map(async ({ token }) => {
       const response = await fetch(endpoint, {
         method: "POST",
@@ -74,8 +82,10 @@ serve(async (req) => {
               conversationId: String(record.conversation_id),
               senderId: String(record.sender_id),
               messageId: String(record.id || ""),
+              icon: "/icons/icon.png",
+              click_action: "/",
             },
-            android: { priority: "high", notification: { channel_id: "messages", sound: "default", default_sound: true } },
+            android: { priority: "high" },
             webpush: { headers: { Urgency: "high" } },
           },
         }),

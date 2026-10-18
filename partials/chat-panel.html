@@ -21,6 +21,12 @@
       </div>
       <div class="chat-header-actions">
         <button id="chat-search-toggle" type="button" title="بحث">🔍</button>
+        <button id="chat-options-toggle" type="button" title="خيارات المحادثة" aria-expanded="false">⋮</button>
+        <div id="chat-options-menu" class="chat-options-menu hidden" role="menu">
+          <button id="chat-remove-member" type="button" class="chat-option-danger hidden" role="menuitem">
+            حذف المستخدم من المحادثة
+          </button>
+        </div>
       </div>
     </header>
 
@@ -46,10 +52,18 @@
     <form id="composer-form" class="composer">
       <button type="button" id="emoji-toggle">😊</button>
       <div id="emoji-panel" class="emoji-panel hidden"></div>
-      <label class="attach-btn">📎<input id="attach-input" type="file" hidden /></label>
+      <label class="attach-btn">📎<input id="attach-input" type="file" accept="image/*,video/*,audio/*" hidden /></label>
       <input id="composer-input" type="text" autocomplete="off" data-i18n-placeholder="type_message" placeholder="اكتب رسالة" />
       <button type="button" id="mic-btn" class="mic-btn" title="رسالة صوتية">🎤</button>
       <button type="submit" id="send-btn" class="send-btn">➤</button>
     </form>
+  </div>
+
+  <div id="media-viewer-modal" class="media-viewer-modal hidden" role="dialog" aria-modal="true" aria-label="عارض الوسائط">
+    <button id="media-viewer-close" class="media-viewer-close" type="button" aria-label="رجوع">←</button>
+    <div class="media-viewer-stage">
+      <img id="media-viewer-image" class="hidden" alt="" />
+      <video id="media-viewer-video" class="hidden" controls playsinline></video>
+    </div>
   </div>
 </section>

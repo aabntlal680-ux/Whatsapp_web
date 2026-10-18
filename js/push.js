@@ -6,6 +6,7 @@ import { initializeApp, getApps } from "https://www.gstatic.com/firebasejs/10.8.
 import {
   getMessaging,
   getToken,
+  deleteToken,
   onMessage,
 } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-messaging.js";
 
@@ -88,165 +89,186 @@ async function registerFirebaseServiceWorker() {
 }
 
 // ---------------------------------------------------------------
-// Enable Push Notifications
+// Token retrieval and persistence
 // ---------------------------------------------------------------
 
-export async function enablePushNotifications(userId = null) {
-  try {
-    const existingToken = localStorage.getItem("fcm_token");
-    if (existingToken && userId) {
-      localStorage.setItem("fcm_user_id", String(userId));
-      return true;
-    }
+async function getCurrentFirebaseToken({ requestPermission = false } = {}) {
+  if (!messaging) {
+    throw new Error("Firebase Messaging غير مهيأ.");
+  }
 
-    if (!messaging) {
-      throw new Error("Firebase Messaging غير مهيأ.");
-    }
+  if (!("Notification" in window)) {
+    throw new Error("هذا المتصفح لا يدعم الإشعارات.");
+  }
 
-    if (!("Notification" in window)) {
-      throw new Error("هذا المتصفح لا يدعم الإشعارات.");
-    }
+  if (!("serviceWorker" in navigator)) {
+    throw new Error("Service Worker غير مدعوم.");
+  }
 
-    if (!("serviceWorker" in navigator)) {
-      throw new Error("Service Worker غير مدعوم.");
-    }
+  if (!window.isSecureContext) {
+    throw new Error("إشعارات Firebase Web تتطلب HTTPS أو localhost.");
+  }
 
-    if (!window.isSecureContext) {
-      throw new Error(
-        "يجب تشغيل الموقع عبر HTTPS لتفعيل الإشعارات."
-      );
-    }
+  let permission = Notification.permission;
+  if (permission !== "granted" && requestPermission) {
+    permission = await Notification.requestPermission();
+  }
 
-    // -----------------------------------------------------------
-    // Request Notification Permission
-    // -----------------------------------------------------------
+  // لا نطلب الإذن تلقائياً من listener عند تحميل الجلسة؛ يمكن للمستخدم
+  // منح الإذن من زر "تفعيل إشعارات الجهاز". إذا كان الإذن ممنوحاً بالفعل،
+  // يُعاد جلب الرمز عند كل تسجيل دخول لضمان تحديثه.
+  if (permission !== "granted") {
+    console.warn("[FCM] Notification permission is not granted.");
+    return null;
+  }
 
-    let permission = Notification.permission;
+  const registration = await registerFirebaseServiceWorker();
+  const token = await getToken(messaging, {
+    vapidKey: VAPID_KEY,
+    serviceWorkerRegistration: registration,
+  });
 
-    if (permission !== "granted") {
-      permission = await Notification.requestPermission();
-    }
+  if (!token) {
+    console.warn("[FCM] لم يتم الحصول على FCM Token.");
+    return null;
+  }
 
-    if (permission !== "granted") {
-      console.warn("[FCM] Notification permission denied.");
-      return false;
-    }
+  return token;
+}
 
-    // -----------------------------------------------------------
-    // Register Firebase Messaging Service Worker
-    // -----------------------------------------------------------
+async function persistFcmToken(userId, currentToken) {
+  if (!userId || !currentToken) return false;
 
-    const registration =
-      await registerFirebaseServiceWorker();
+  const { supabase } = await import("./supabaseClient.js");
 
-    // -----------------------------------------------------------
-    // Get FCM Token
-    // -----------------------------------------------------------
+  // المسار المفضل ذري وآمن: دالة SQL ذات صلاحيات محدودة تحذف ملكية الرمز
+  // السابقة ثم تملكه للمستخدم الحالي. تُضاف هذه الدالة في sql/fcm_and_rls.sql.
+  const { error: claimError } = await supabase.rpc("claim_fcm_token", {
+    p_user_id: userId,
+    p_token: currentToken,
+    p_platform: "web",
+  });
 
-    const token = await getToken(messaging, {
-      vapidKey: VAPID_KEY,
-      serviceWorkerRegistration: registration,
-    });
-
-    if (!token) {
-      console.warn(
-        "[FCM] لم يتم الحصول على FCM Token."
-      );
-      return false;
-    }
-
-    console.log("[FCM] FCM Token:", token);
-
-    // -----------------------------------------------------------
-    // Save Token
-    // -----------------------------------------------------------
-
-    localStorage.setItem(
-      "fcm_token",
-      token
-    );
-
-    if (userId) {
-      localStorage.setItem(
-        "fcm_user_id",
-        String(userId)
-      );
-    }
-
-    // -----------------------------------------------------------
-    // Save Token to Supabase (fcm_tokens table)
-    // -----------------------------------------------------------
-    // انظر sql/schema.sql (قسم "FCM PUSH TOKENS") لتعريف الجدول والصلاحيات.
-    if (userId) {
-      try {
-        const { supabase } = await import("./supabaseClient.js");
-        const { error } = await supabase.from("fcm_tokens").upsert(
-          {
-            user_id: userId,
-            token,
-            platform: "web",
-            updated_at: new Date().toISOString(),
-          },
-          { onConflict: "token" }
-        );
-        if (error) {
-          console.error("[FCM] فشل حفظ التوكن في Supabase:", error);
-        }
-      } catch (error) {
-        // لا نمنع نجاح تفعيل الإشعارات محلياً حتى لو فشل حفظ التوكن في القاعدة —
-        // لكن نُسجّل الخطأ بوضوح ليتم تتبعه (مثال: انقطاع مؤقت 503 من Supabase).
-        console.error("[FCM] خطأ غير متوقع أثناء حفظ التوكن:", error);
-      }
-    }
-
+  if (!claimError) {
+    localStorage.setItem("fcm_token", currentToken);
+    localStorage.setItem("fcm_user_id", String(userId));
+    console.log("[FCM] تم ربط الرمز بالمستخدم:", userId);
     return true;
+  }
 
+  // توافق مع قواعد البيانات التي لم تُطبَّق عليها الدالة بعد. هذا المسار
+  // ينفذ الحذف ثم upsert المطلوبين مباشرةً، مع تسجيل الخطأ لتسهيل الترحيل.
+  console.warn("[FCM] claim_fcm_token غير متاح؛ استخدام مسار الحذف/upsert المباشر:", claimError);
+
+  // قد ينتقل جهاز واحد بين حسابات متعددة. احذف أي ملكية قديمة للرمز قبل
+  // upsert حتى لا تصل الإشعارات إلى المستخدم السابق.
+  const { error: foreignTokenError } = await supabase
+    .from("fcm_tokens")
+    .delete()
+    .eq("token", currentToken)
+    .neq("user_id", userId);
+
+  if (foreignTokenError) {
+    console.warn("[FCM] تعذّر حذف ملكية الرمز القديمة:", foreignTokenError);
+  }
+
+  // لا يشمل neq صفوف user_id = null في PostgreSQL، لذلك نعالجها صراحةً.
+  const { error: anonymousTokenError } = await supabase
+    .from("fcm_tokens")
+    .delete()
+    .eq("token", currentToken)
+    .is("user_id", null);
+
+  if (anonymousTokenError) {
+    console.warn("[FCM] تعذّر حذف الرمز غير المرتبط بحساب:", anonymousTokenError);
+  }
+
+  const { error } = await supabase.from("fcm_tokens").upsert(
+    {
+      user_id: userId,
+      token: currentToken,
+      platform: "web",
+      updated_at: new Date().toISOString(),
+    },
+    { onConflict: "user_id,token" }
+  );
+
+  if (error) {
+    console.error("[FCM] فشل حفظ التوكن في Supabase:", error);
+    return false;
+  }
+
+  localStorage.setItem("fcm_token", currentToken);
+  localStorage.setItem("fcm_user_id", String(userId));
+  console.log("[FCM] تم ربط الرمز بالمستخدم:", userId);
+  return true;
+}
+
+// تُستدعى من دورة Supabase Auth عند SIGNED_IN أو عند وجود جلسة محفوظة.
+export async function registerFcmToken(userId) {
+  if (!userId) return false;
+
+  try {
+    const currentToken = await getCurrentFirebaseToken();
+    if (!currentToken) return false;
+    return await persistFcmToken(userId, currentToken);
   } catch (error) {
-    console.error(
-      "[FCM] enablePushNotifications:",
-      error
-    );
-
+    console.error("[FCM] registerFcmToken:", error);
     return false;
   }
 }
 
-// ---------------------------------------------------------------
-// Disable Push Notifications
-// ---------------------------------------------------------------
+// زر التفعيل اليدوي يطلب إذن الإشعارات ثم يستخدم نفس مسار التسجيل الموحد.
+export async function enablePushNotifications(userId = null) {
+  if (!userId) return false;
 
-export async function disablePushNotifications() {
   try {
-    const token = localStorage.getItem("fcm_token");
-    const userId = localStorage.getItem("fcm_user_id");
+    const currentToken = await getCurrentFirebaseToken({ requestPermission: true });
+    if (!currentToken) return false;
+    return await persistFcmToken(userId, currentToken);
+  } catch (error) {
+    console.error("[FCM] enablePushNotifications:", error);
+    return false;
+  }
+}
 
+// إزالة رمز الجهاز من الحساب قبل تسجيل الخروج، مع تنظيف الحالة المحلية دائماً.
+export async function removeFcmToken(userId = null) {
+  const token = localStorage.getItem("fcm_token");
+  const storedUserId = localStorage.getItem("fcm_user_id");
+  const ownerId = userId || storedUserId;
+
+  try {
     if (token) {
-      try {
-        const { supabase } = await import("./supabaseClient.js");
-        const query = supabase.from("fcm_tokens").delete().eq("token", token);
-        const { error } = userId ? await query.eq("user_id", userId) : await query;
-        if (error) {
-          console.error("[FCM] فشل حذف التوكن من Supabase:", error);
-        }
-      } catch (error) {
-        console.error("[FCM] خطأ غير متوقع أثناء حذف التوكن:", error);
+      const { supabase } = await import("./supabaseClient.js");
+      let query = supabase.from("fcm_tokens").delete().eq("token", token);
+      if (ownerId) query = query.eq("user_id", ownerId);
+
+      const { error } = await query;
+      if (error) {
+        console.error("[FCM] فشل حذف التوكن من Supabase:", error);
       }
     }
 
+    if (messaging) {
+      try {
+        await deleteToken(messaging);
+      } catch (firebaseError) {
+        console.warn("[FCM] تعذّر إبطال التوكن عبر Firebase:", firebaseError);
+      }
+    }
+  } catch (error) {
+    console.error("[FCM] removeFcmToken:", error);
+  } finally {
     localStorage.removeItem("fcm_token");
     localStorage.removeItem("fcm_user_id");
-
-    console.log("[FCM] تم تعطيل الإشعارات محليًا.");
-
-    return true;
-  } catch (error) {
-    console.error(
-      "[FCM] disablePushNotifications:",
-      error
-    );
-
-    return false;
   }
+
+  return true;
+}
+
+export async function disablePushNotifications(userId = null) {
+  return removeFcmToken(userId);
 }
 
 // ---------------------------------------------------------------
@@ -294,56 +316,22 @@ export function listenForForegroundMessages({
         data.body ||
         "لديك رسالة جديدة";
 
-      // ---------------------------------------------------------
-      // Play Sound
-      // ---------------------------------------------------------
+      // في حالة foreground لا نستدعي showNotification من Service Worker؛
+      // ذلك سيحوّل التنبيه إلى إشعار نظام. بدلاً منه يحدّث callback واجهة
+      // التطبيق ويشغّل الصوت، بينما يتولى firebase-messaging-sw.js إشعار
+      // النظام فقط عندما تكون الصفحة في الخلفية.
+      if (document.visibilityState !== "visible") {
+        return;
+      }
 
       try {
         const audio = new Audio(soundUrl);
-
         audio.volume = 1;
-
         await audio.play().catch(() => {
-          console.warn(
-            "[FCM] تشغيل الصوت التلقائي محظور من المتصفح."
-          );
+          console.warn("[FCM] تشغيل الصوت التلقائي محظور من المتصفح.");
         });
       } catch (error) {
-        console.warn(
-          "[FCM] Audio error:",
-          error
-        );
-      }
-
-      // ---------------------------------------------------------
-      // Visible Notification — عبر registration.showNotification() حصرياً
-      // ---------------------------------------------------------
-      // *** الإصلاح الجوهري ***
-      // new Notification(...) يرمي خطأ "Illegal constructor" على متصفحات
-      // الأندرويد (خصوصاً Chrome for Android)، وهو ما كان يمنع ظهور الإشعار
-      // المرئي رغم سماع صوت التنبيه. الحل الوحيد المتوافق عبر كل المتصفحات هو
-      // استخدام ServiceWorkerRegistration.showNotification() دائماً.
-      if (
-        Notification.permission === "granted" &&
-        document.visibilityState === "visible"
-      ) {
-        try {
-          const registration = await navigator.serviceWorker.ready;
-
-          await registration.showNotification(title, {
-            body,
-            icon: "./icons/icon.png",
-            badge: "./icons/icon.png",
-            tag: "whatsapp-web-message",
-            data,
-            vibrate: [100, 50, 100],
-          });
-        } catch (error) {
-          console.warn(
-            "[FCM] Foreground showNotification error:",
-            error
-          );
-        }
+        console.warn("[FCM] Audio error:", error);
       }
 
       // ---------------------------------------------------------
